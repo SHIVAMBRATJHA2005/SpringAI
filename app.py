@@ -1,137 +1,90 @@
-## RAG Q&A Conversation With PDF Including Chat History
 import streamlit as st
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_chroma import Chroma
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from pathlib import Path
+from langchain.agents import create_sql_agent
+from langchain.sql_database import SQLDatabase
+from langchain.agents.agent_types import AgentType
+from langchain.callbacks import StreamlitCallbackHandler
+from langchain.agents.agent_toolkits import SQLDatabaseToolkit
+from sqlalchemy import create_engine
+import sqlite3
 from langchain_groq import ChatGroq
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-import os
 
-from dotenv import load_dotenv
-load_dotenv()
+st.set_page_config(page_title="LangChain: Chat with SQL DB", page_icon="🦜")
+st.title("🦜 LangChain: Chat with SQL DB")
 
-os.environ['HF_TOKEN']=os.getenv("HF_TOKEN")
-embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+LOCALDB="USE_LOCALDB"
+MYSQL="USE_MYSQL"
 
+radio_opt=["Use SQLLite 3 Database- Student.db","Connect to you MySQL Database"]
 
-## set up Streamlit 
-st.title("Conversational RAG With PDF uplaods and chat history")
-st.write("Upload Pdf's and chat with their content")
+selected_opt=st.sidebar.radio(label="Choose the DB which you want to chat",options=radio_opt)
 
-## Input the Groq API Key
-api_key=st.text_input("Enter your Groq API key:",type="password")
-
-## Check if groq api key is provided
-if api_key:
-    llm=ChatGroq(groq_api_key=api_key,model_name="Gemma2-9b-It")
-
-    ## chat interface
-
-    session_id=st.text_input("Session ID",value="default_session")
-    ## statefully manage chat history
-
-    if 'store' not in st.session_state:
-        st.session_state.store={}
-
-    uploaded_files=st.file_uploader("Choose A PDf file",type="pdf",accept_multiple_files=True)
-    ## Process uploaded  PDF's
-    if uploaded_files:
-        documents=[]
-        for uploaded_file in uploaded_files:
-            temppdf=f"./temp.pdf"
-            with open(temppdf,"wb") as file:
-                file.write(uploaded_file.getvalue())
-                file_name=uploaded_file.name
-
-            loader=PyPDFLoader(temppdf)
-            docs=loader.load()
-            documents.extend(docs)
-
-    # Split and create embeddings for the documents
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
-        splits = text_splitter.split_documents(documents)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever()    
-
-        contextualize_q_system_prompt=(
-            "Given a chat history and the latest user question"
-            "which might reference context in the chat history, "
-            "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
-        )
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", contextualize_q_system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ]
-            )
-        
-        history_aware_retriever=create_history_aware_retriever(llm,retriever,contextualize_q_prompt)
-
-        ## Answer question
-
-        # Answer question
-        system_prompt = (
-                "You are an assistant for question-answering tasks. "
-                "Use the following pieces of retrieved context to answer "
-                "the question. If you don't know the answer, say that you "
-                "don't know. Use three sentences maximum and keep the "
-                "answer concise."
-                "\n\n"
-                "{context}"
-            )
-        qa_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ]
-            )
-        
-        question_answer_chain=create_stuff_documents_chain(llm,qa_prompt)
-        rag_chain=create_retrieval_chain(history_aware_retriever,question_answer_chain)
-
-        def get_session_history(session:str)->BaseChatMessageHistory:
-            if session_id not in st.session_state.store:
-                st.session_state.store[session_id]=ChatMessageHistory()
-            return st.session_state.store[session_id]
-        
-        conversational_rag_chain=RunnableWithMessageHistory(
-            rag_chain,get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
-        )
-
-        user_input = st.text_input("Your question:")
-        if user_input:
-            session_history=get_session_history(session_id)
-            response = conversational_rag_chain.invoke(
-                {"input": user_input},
-                config={
-                    "configurable": {"session_id":session_id}
-                },  # constructs a key "abc123" in `store`.
-            )
-            st.write(st.session_state.store)
-            st.write("Assistant:", response['answer'])
-            st.write("Chat History:", session_history.messages)
+if radio_opt.index(selected_opt)==1:
+    db_uri=MYSQL
+    mysql_host=st.sidebar.text_input("Provide MySQL Host")
+    mysql_user=st.sidebar.text_input("MYSQL User")
+    mysql_password=st.sidebar.text_input("MYSQL password",type="password")
+    mysql_db=st.sidebar.text_input("MySQL database")
 else:
-    st.warning("Please enter the GRoq API Key")
+    db_uri=LOCALDB
 
+api_key=st.sidebar.text_input(label="GRoq API Key",type="password")
 
+if not db_uri:
+    st.info("Please enter the database information and uri")
 
+if not api_key:
+    st.info("Please add the groq api key")
 
+## LLM model
+llm=ChatGroq(groq_api_key=api_key,model_name="Llama3-8b-8192",streaming=True)
 
+@st.cache_resource(ttl="2h")
+def configure_db(db_uri,mysql_host=None,mysql_user=None,mysql_password=None,mysql_db=None):
+    if db_uri==LOCALDB:
+        dbfilepath=(Path(__file__).parent/"student.db").absolute()
+        print(dbfilepath)
+        creator = lambda: sqlite3.connect(f"file:{dbfilepath}?mode=ro", uri=True)
+        return SQLDatabase(create_engine("sqlite:///", creator=creator))
+    elif db_uri==MYSQL:
+        if not (mysql_host and mysql_user and mysql_password and mysql_db):
+            st.error("Please provide all MySQL connection details.")
+            st.stop()
+        return SQLDatabase(create_engine(f"mysql+mysqlconnector://{mysql_user}:{mysql_password}@{mysql_host}/{mysql_db}"))   
+    
+if db_uri==MYSQL:
+    db=configure_db(db_uri,mysql_host,mysql_user,mysql_password,mysql_db)
+else:
+    db=configure_db(db_uri)
 
+## toolkit
+toolkit=SQLDatabaseToolkit(db=db,llm=llm)
 
+agent=create_sql_agent(
+    llm=llm,
+    toolkit=toolkit,
+    verbose=True,
+    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION
+)
 
+if "messages" not in st.session_state or st.sidebar.button("Clear message history"):
+    st.session_state["messages"] = [{"role": "assistant", "content": "How can I help you?"}]
+
+for msg in st.session_state.messages:
+    st.chat_message(msg["role"]).write(msg["content"])
+
+user_query=st.chat_input(placeholder="Ask anything from the database")
+
+if user_query:
+    st.session_state.messages.append({"role": "user", "content": user_query})
+    st.chat_message("user").write(user_query)
+
+    with st.chat_message("assistant"):
+        streamlit_callback=StreamlitCallbackHandler(st.container())
+        response=agent.run(user_query,callbacks=[streamlit_callback])
+        st.session_state.messages.append({"role":"assistant","content":response})
+        st.write(response)
+
+        
 
 
